@@ -1,0 +1,1062 @@
+using ABBYY.FlexiCapture;
+using Newtonsoft.Json;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Permissions;
+using System.Text;
+using System.Threading;
+
+public static class Autocorrection
+{
+
+    public static Dictionary<string, string> symbols = new Dictionary<string, string>()
+    {
+        {"０", "0"},
+        {"１", "1"},
+        {"２", "2"},
+        {"３", "3"},
+        {"４", "4"},
+        {"５", "5"},
+        {"６", "6"},
+        {"７", "7"},
+        {"８", "8"},
+        {"９", "9"},
+        {"、", ","},
+    };
+
+}
+
+namespace GlobalRuleScriptModule
+{
+    /// <summary>
+    /// Main class of the connector that is being used for recognition in Tegaki
+    /// </summary>
+    public class RecognitionScript
+    {
+        /// <summary>
+        /// Value of the field from the recognition script
+        /// </summary>
+        public IValue Result { get; private set; }
+        /// <summary>
+        /// Region of the field from the recognition script
+        /// </summary>
+        public IFieldRegion FieldRegion { get; private set; }
+        /// <summary>
+        /// Short name of the field
+        /// Must be unique for document section
+        /// </summary>
+        public string Name { get; private set; }
+        /// <summary>
+        /// Logger instance
+        /// </summary>
+        static private Logger logger;
+        /// <summary>
+        /// Main constructor
+        /// </summary>
+        /// <param name="result">From FC. See property description</param>
+        /// <param name="fieldRegion">From FC. See property description</param>
+        /// <param name="name">See property description</param>
+        public RecognitionScript(IValue result, IFieldRegion fieldRegion, string name)
+        {
+            Result = result;
+            FieldRegion = fieldRegion;
+            Name = name;
+            logger = new Logger();
+        }
+        /// <summary>
+        /// Main method is usually called when the operator changes the region of the field
+        /// </summary>
+        public void Execute()
+        {
+            try
+            {
+                if (FieldRegion.Page.Document.DefinitionName != "SampleDocDef")
+                    return;
+                var serializedField = GetFFR(FieldRegion, Name);
+                if (serializedField == null)
+                    return;
+                var provider = new TegakiFcProvider();
+                var request = new PostRequest();
+                var newField = new FieldForRecognition(FieldRegion, serializedField.Type,
+                    serializedField.Name, serializedField.Settings, serializedField.Confidence);
+                provider.ProcessFields(new List<FieldForRecognition>() { newField }, ref request);
+                // Send request to Tegaki and fill all fields  
+                logger.Write("Re-recognizing the field \"" + Name + "\"...");
+                var response = provider.GetRecognitionResults(request.ToString());
+                var recognitionResult = response.results.FirstOrDefault();
+                var characters = new List<GetResponseCharacter>();
+                var value = string.Empty;
+                switch (newField.Type)
+                {
+                    case FieldType.Text:
+                        if (recognitionResult.singleLine != null)
+                        {
+                            value = recognitionResult.singleLine.text;
+                            characters = recognitionResult.singleLine.characters;
+                        }
+                        break;
+                    case FieldType.Boxed:
+                        if (recognitionResult.boxedCharacters != null)
+                        {
+                            value = recognitionResult.boxedCharacters.text;
+                            characters = recognitionResult.boxedCharacters.characters;
+                        }
+                        break;
+                    case FieldType.Multiline:
+                        if (recognitionResult.multiLine != null)
+                        {
+                            value = string.Join("\n", recognitionResult.multiLine.lines.Select(item => item.text)) ?? string.Empty;
+                            characters = recognitionResult.multiLine.lines.SelectMany(item => item.characters).ToList();
+                        }
+                        break;
+                    default:
+                        throw new Exception("フィールドタイプはサポートされていません。");
+                        break;
+                }
+                Result.Text = value;
+                // Set characters confidence
+                SetIsSuspicious(characters, newField.Confidence);
+                logger.Write("Result from Tegaki received.");
+            }
+            catch (Exception ex)
+            {
+                FCTools.ShowMessage("exception in rec script" + ex.ToString());
+            }
+        }
+        /// <summary>
+        /// All the field for recognitions in the form as they are sent to tegaki but without image data
+        /// are also saved to the document registration parameters on the ICRRecognition stage
+        /// This method extracts the serialized field (and its recognition settings)
+        /// and al
+        /// </summary>
+        /// <param name="fieldRegion">Needed to get field settings from document properties</param>
+        /// <param name="name">Short name of the field</param>
+        /// <returns>FieldForRecognition instance</returns>
+        private FieldForRecognition GetFFR(IFieldRegion fieldRegion, string name)
+        {
+            if (!fieldRegion.Page.Document.Properties.Has(Constants.IcrSettingsProperty)
+                || string.IsNullOrEmpty(fieldRegion.Page.Document.Properties.Get(Constants.IcrSettingsProperty)))
+                return null;
+            var fields = JsonConvert.DeserializeObject<List<FieldForRecognition>>(fieldRegion.Page.Document.Properties.Get(Constants.IcrSettingsProperty));
+            var filter = fields.Where(x => x.Name == name);
+            if (filter == null)
+                throw new Exception("Server answer is different form request");
+            var result = filter.FirstOrDefault();
+            if (result == null)
+                throw new Exception("Server answer is different form request");
+            return result;
+        }
+        /// <summary>
+        /// Highlights the symbols in FC based on confidence threshold
+        /// </summary>
+        /// <param name="characters">List of characters from Tegaki AI</param>
+        /// <param name="confidence">Confidence threshold</param>
+        private void SetIsSuspicious(List<GetResponseCharacter> characters, double confidence)
+        {
+            if (characters == null)
+                return;
+            int delta = 0;
+            for (int i = 0; i < characters.Count; i++)
+            {
+                if (Result.Symbols[i + delta].Symbol == "\n")
+                    delta++;
+                if (characters[i].confidence < confidence)
+                    Result.Symbols[i + delta].IsSuspicious = true;
+            }
+        }
+    }
+    /// <summary>
+    /// Logger serves for extended recognition process logging
+    /// </summary>
+    class Logger
+    {
+        /// <summary>
+        /// Key that indicates is extended logging enabled
+        /// </summary>
+        private string logEnabled;
+        /// <summary>
+        /// Main constructor
+        /// </summary>
+        public Logger()
+        {
+            if (FCTools.ScriptContext.Project.EnvironmentVariables.Has("ExtendedLogWriting"))
+                logEnabled = FCTools.ScriptContext.Project.EnvironmentVariables.Get("ExtendedLogWriting");
+        }
+        /// <summary>
+        /// Writes a message to processing log if enabled
+        /// </summary>
+        /// <param name="message">Message to log</param>
+        public void Write(string message)
+        {
+            if (logEnabled == "Enable")
+                FCTools.ShowMessage(message);
+        }
+    }
+    /// <summary>
+    /// Field types according to Tegaki API documentation
+    /// </summary>
+    public enum FieldType
+    {
+        Text,
+        Boxed,
+        Multiline
+    };
+    /// <summary>
+    /// Constructed field with data required for processing
+    /// </summary>
+    public class FieldForRecognition
+    {
+        /// <summary>
+        /// Full name of the field in document definition
+        /// </summary>
+        [JsonProperty("Name")]
+        public string FullName { get; set; }
+        /// <summary>
+        /// Short field name DEPRECATED
+        /// </summary>
+        [JsonIgnore]
+        public string Name { get; private set; }
+        /// <summary>
+        /// Characters with confidence below this value will be highlighlighted on document data form in FlexiCapture
+        /// </summary>
+        public double Confidence { get; set; }
+        /// <summary>
+        /// Field type according to Tegaki API documentation
+        /// </summary>
+        public FieldType Type { get; private set; }
+        /// <summary>
+        /// Constructed field recognition settings
+        /// </summary>
+        public RecognitionSettings Settings { get; internal set; }
+        /// <summary>
+        /// Jpg or png image in base64 format
+        /// </summary>
+        [JsonIgnore]
+        public string ImageData { get; set; }
+        /// <summary>
+        /// Serializer for sending to tegaki
+        /// </summary>
+        /// <param name="name">Short field name that does not contain '\'</param>
+        /// <param name="type">Field type</param>
+        /// <param name="settings">Recognition settings</param>
+        /// <param name="confidence">Confidence level specified in range from 0 to 1 in percent</param>
+        /// <param name="imageData">Image in base64 string</param>
+        [JsonConstructor]
+        internal FieldForRecognition(string name, FieldType type, RecognitionSettings settings, double confidence,
+            string imageData)
+        {
+            FullName = name;
+            Name = name;
+            Type = type;
+            Settings = settings;
+            Confidence = confidence;
+            ImageData = imageData;
+        }
+        /// <summary>
+        /// Constructor that is used in FC in custom recognition scripts
+        /// (they are located in Document definition editor in field properties -> Recognition tab)
+        /// </summary>
+        /// <param name="fieldRegion">FC field region</param>
+        /// <param name="type">Field type</param>
+        /// <param name="name">Field name</param>
+        /// <param name="settings">Recognition settings</param>
+        /// <param name="confidence">Confidence level specified in range from 0 to 1 in percent</param>
+        public FieldForRecognition(IFieldRegion fieldRegion, FieldType type, string name,
+            RecognitionSettings settings, double confidence)
+        {
+            FullName = name;
+            Name = name;
+            Type = type;
+            Settings = settings;
+            Confidence = confidence;
+            if (fieldRegion != null)
+                ImageData = GetFieldRegionImage(fieldRegion.Picture.CreateEditableCopy());
+        }
+        /// <summary>
+        /// Converts an image of field region to a string
+        /// </summary>
+        /// <param name="pic">IEditablePictureObject instance from FC</param>
+        /// <returns>base64 string of the image</returns>
+        private string GetFieldRegionImage(IEditablePictureObject pic)
+        {
+            var bitmap = Image.FromHbitmap(new IntPtr(pic.Handle));
+            return GetFieldRegionImage(bitmap);
+        }
+        /// <summary>
+        /// Converts a bitmap to base64 string
+        /// </summary>
+        /// <param name="bitmap">Picture</param>
+        /// <returns>base64 string of the bitmap</returns>
+        public static string GetFieldRegionImage(Bitmap bitmap)
+        {
+            var memoryStream = new MemoryStream();
+            bitmap.Save(memoryStream, System.Drawing.Imaging.ImageFormat.Jpeg);
+            return Convert.ToBase64String(memoryStream.ToArray());
+        }
+    }
+    /// <summary>
+    /// Constructed field recognition settings
+    /// </summary>
+    public class RecognitionSettings
+    {
+        /// <summary>
+        /// Use hiragana
+        /// </summary>
+        public bool UseHiragana { get; protected set; }
+        /// <summary>
+        /// Use katakana
+        /// </summary>
+        public bool UseKatakana { get; protected set; }
+        /// <summary>
+        /// Use kanji
+        /// </summary>
+        public bool UseKanji { get; protected set; }
+        /// <summary>
+        /// Use digits 
+        /// </summary>
+        public bool UseDigits { get; protected set; }
+        /// <summary>
+        /// Use upper case latin
+        /// </summary>
+        public bool UseUpperCaseLatin { get; protected set; }
+        /// <summary>
+        /// Use lower case latin
+        /// </summary>
+        public bool UseLowerCaseLatin { get; protected set; }
+        /// <summary>
+        /// Use punctuation
+        /// </summary>
+        public bool UsePunctuation { get; protected set; }
+        /// <summary>
+        /// Number of boxes if boxed field
+        /// Note that after the subtraction of the form the boxes disappear
+        /// that is why the setter is public
+        /// </summary>
+        public int BoxesNumber { get; set; }
+        /// <summary>
+        /// Margin
+        /// </summary>
+        public int Margin { get; protected set; }
+        /// <summary>
+        /// Serialization result is sent to Tegaki
+        /// </summary>
+        /// <param name="Hiragana">Use Hiragana</param>
+        /// <param name="Katakana">Use Katakana</param>
+        /// <param name="Kanji">Use Kanji</param>
+        /// <param name="Digits">UseDigits</param>
+        /// <param name="UpperCaseLatin">Use UpperCaseLatin</param>
+        /// <param name="LowerCaseLatin">Use LowerCaseLatin</param>
+        /// <param name="Punctuation">Use Punctuation</param>
+        /// <param name="BoxesNumber">Number of boxes</param>
+        /// <param name="Margin">Margin</param>
+        [JsonConstructor]
+        public RecognitionSettings(bool Hiragana = false, bool Katakana = false, bool Kanji = false,
+            bool Digits = false, bool UpperCaseLatin = false, bool LowerCaseLatin = false,
+            bool Punctuation = false, int BoxesNumber = 0, int Margin = 0)
+        {
+            bool useAll = !Hiragana
+                          && !Katakana
+                          && !Kanji
+                          && !Digits
+                          && !UpperCaseLatin
+                          && !LowerCaseLatin
+                          && !Punctuation;
+            UseHiragana = useAll || Hiragana;
+            UseKatakana = useAll || Katakana;
+            UseKanji = useAll || Kanji;
+            UseDigits = useAll || Digits;
+            UseUpperCaseLatin = useAll || UpperCaseLatin;
+            UseLowerCaseLatin = useAll || LowerCaseLatin;
+            UsePunctuation = useAll || Punctuation;
+            this.BoxesNumber = BoxesNumber;
+            this.Margin = Margin;
+        }
+        /// <summary>
+        /// Constructor that is used in FlexiCapture scripts
+        /// </summary>
+        /// <param name="type">Character type</param>
+        /// <param name="BoxesNumber">Number of boxes</param>
+        /// <param name="Margin">Margin</param>
+        public RecognitionSettings(CharacterType type, int BoxesNumber = 0, int Margin = 0)
+        {
+            switch (type)
+            {
+                case CharacterType.Digits:
+                    UseDigits = true;
+                    UsePunctuation = true;
+                    break;
+                case CharacterType.Latin:
+                    UseUpperCaseLatin = true;
+                    UseLowerCaseLatin = true;
+                    break;
+                case CharacterType.Japan:
+                    UseHiragana = true;
+                    UseKatakana = true;
+                    UseKanji = true;
+                    break;
+                case CharacterType.DigitsAndJapan:
+                    UseHiragana = true;
+                    UseKatakana = true;
+                    UseKanji = true;
+                    UseDigits = true;
+                    break;
+                case CharacterType.DigitsAndLatin:
+                    UseUpperCaseLatin = true;
+                    UseLowerCaseLatin = true;
+                    UseDigits = true;
+                    break;
+                case CharacterType.All:
+                    UsePunctuation = true;
+                    UseDigits = true;
+                    UseUpperCaseLatin = true;
+                    UseLowerCaseLatin = true;
+                    UseHiragana = true;
+                    UseKatakana = true;
+                    UseKanji = true;
+                    break;
+                default:
+                    System.Diagnostics.Trace.Assert(false);
+                    break;
+            }
+            this.BoxesNumber = BoxesNumber;
+            this.Margin = Margin;
+        }
+    }
+    /// <summary>
+    /// Character types of symbols in the constructed field
+    /// </summary>
+    public enum CharacterType
+    {
+        Latin,
+        Japan,
+        All,
+        DigitsAndLatin,
+        DigitsAndJapan,
+        Digits
+    };
+    /// <summary>
+    /// Constants for environment variable names and other for convenient use in scripts
+    /// </summary>
+    public class Constants
+    {
+        /// <summary>
+        /// Name of the environmental variable that contains Tegaki API key
+        /// </summary>
+        public const string ApiKey = "TegakiApiKey";
+        /// <summary>
+        /// Name of the environmental variable that contains Tegaki API URI
+        /// </summary>
+        public const string ApiUri = "TegakiBaseApiUri";
+        /// <summary>
+        /// Name of the environmental variable that enables or disables performing of deletion of recognition data from Tegaki server
+        /// </summary>
+        public const string ApiDeleteRecognitionData = "TegakiDeleteRecognitionDataFromServer";
+        /// <summary>
+        /// Name of the registration parameter of a document where the recognition settings saved
+        /// </summary>
+        public const string IcrSettingsProperty = "TegakiSettings";
+    }
+    /// <summary>
+    /// Provider class between FlexiCapture project and Tegaki API
+    /// This class provides tools for recognizing regions of fields. You must specify the following values in environment variables:
+    /// "TegakiApiKey", "TegakiBaseApiUri" and "TegakiDeleteRecognitionDataFromServer".</summary>
+    public class TegakiFcProvider
+    {
+        /// <summary>
+        /// Tegaki connector instance
+        /// </summary>
+        public TegakiConnector TegakiProvider { get; private set; }
+        /// <summary>
+        /// Stores marker that indicates should recognition data be deleted from Tegaki server
+        /// </summary>
+        private string deleteRecognitionData = string.Empty;
+        /// <summary>
+        /// Main constructor
+        /// </summary>
+        [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
+        public TegakiFcProvider()
+        {
+            if (!FCTools.ScriptContext.Project.EnvironmentVariables.Has(Constants.ApiKey)
+                || string.IsNullOrEmpty(FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiKey)))
+                throw new Exception(Constants.ApiKey + "のための環境を設定する必要があります。");
+            if (!FCTools.ScriptContext.Project.EnvironmentVariables.Has(Constants.ApiUri)
+                || string.IsNullOrEmpty(FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiUri)))
+                throw new Exception(Constants.ApiUri + " のための環境を設定する必要があります。");
+            if (!FCTools.ScriptContext.Project.EnvironmentVariables.Has(Constants.ApiDeleteRecognitionData)
+                || string.IsNullOrEmpty(FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiDeleteRecognitionData))
+                || (FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiDeleteRecognitionData) != "Enable"
+                && FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiDeleteRecognitionData) != "Disable"))
+                throw new Exception(Constants.ApiDeleteRecognitionData + " のための環境を設定する必要があります。");
+            else
+                deleteRecognitionData = FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiDeleteRecognitionData);
+            TegakiProvider = new TegakiConnector(
+                FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiKey),
+                FCTools.ScriptContext.Project.EnvironmentVariables.Get(Constants.ApiUri));
+        }
+        /// <summary>
+        /// Main method that creates the request to tegaki from the list of fields
+        /// </summary>
+        /// <param name="fieldsForIcr">List of fields for recognition</param>
+        /// <param name="request">Post request formed according to Tegaki specification</param>
+        /// <returns>True if at least one field was added</returns>
+        public bool ProcessFields(List<FieldForRecognition> fieldsForIcr, ref PostRequest request)
+        {
+            var fieldAdded = false;
+            foreach (var fieldForIcr in fieldsForIcr)
+            {
+                try
+                {
+                    var field = new PostRequestField()
+                    {
+                        name = "Field"
+                    };
+                    switch (fieldForIcr.Type)
+                    {
+                        case FieldType.Text:
+                            field.singleLine = CreateSingleLine(fieldForIcr);
+                            break;
+                        case FieldType.Multiline:
+                            field.multiLine = CreateMultiLine(fieldForIcr);
+                            break;
+                        case FieldType.Boxed:
+                            field.boxedCharacters = CreateBoxedCharacters(fieldForIcr);
+                            break;
+                        default:
+                            throw new Exception("フィールドタイプはサポートされていません。");
+                            break;
+                    }
+                    request.fields.Add(field);
+                    fieldAdded = true;
+                }
+                catch
+                {
+                    // In case of model inaccuracies
+                    continue;
+                }
+            }
+            return fieldAdded;
+        }
+        /// <summary>
+        /// Sends a request to Tegaki, returns the response and delete recognition data from Tegaki server
+        /// </summary>
+        /// <param name="request">Request string</param>
+        /// <returns>Response as GetResponse</returns>
+        public GetResponse GetRecognitionResults(string request)
+        {
+            ServicePointManager.Expect100Continue = true;
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            var requestId = TegakiProvider.SendPostRequest(request);
+            // Trying to get response while it will not be received
+            GetResponse response;
+            int counter = 0;
+            do
+            {
+                if (counter++ > 50)
+                    throw new TimeoutException("Tegaki APIからのレスポンスを得ることができません。");
+                Thread.Sleep(1000);
+            } while (!TegakiProvider.GetRecognitionResult(requestId, out response));
+            //Delete recognition data from server
+            if (deleteRecognitionData == "Enable")
+            {
+                TegakiProvider.DeleteRecognitionResults(requestId);
+            }
+            return response;
+        }
+        /// <summary>
+        /// Creates single line object for post request for constructed field
+        /// </summary>
+        /// <param name="fieldForIcr">Constructed field to create PostRequestSingleLine with</param>
+        /// <returns>PostRequestSingleLine instance</returns>
+        private PostRequestSingleLine CreateSingleLine(FieldForRecognition fieldForIcr)
+        {
+            var newCharacterType = new PostRequestCharacterType()
+            {
+                digits = fieldForIcr.Settings.UseDigits,
+                hiragana = fieldForIcr.Settings.UseHiragana,
+                kanji = fieldForIcr.Settings.UseKanji,
+                katakana = fieldForIcr.Settings.UseKatakana,
+                lowerCaseLatin = fieldForIcr.Settings.UseLowerCaseLatin,
+                upperCaseLatin = fieldForIcr.Settings.UseUpperCaseLatin,
+                punctuation = fieldForIcr.Settings.UsePunctuation,
+            };
+            return new PostRequestSingleLine()
+            {
+                characterType = newCharacterType,
+                configuration = new PostRequestConfiguration() { languageModel = DoesLanguageModelExists(newCharacterType) },
+                imageData = fieldForIcr.ImageData
+            };
+        }
+        /// <summary>
+        ///  Creates multiline object for post request for constructed field
+        /// </summary>
+        /// <param name="fieldForIcr">Constructed field to create PostRequestMultiLine with</param>
+        /// <returns>PostRequestMultiLine instance</returns>
+        private PostRequestMultiLine CreateMultiLine(FieldForRecognition fieldForIcr)
+        {
+            var newCharacterType = new PostRequestCharacterType()
+            {
+                digits = fieldForIcr.Settings.UseDigits,
+                hiragana = fieldForIcr.Settings.UseHiragana,
+                kanji = fieldForIcr.Settings.UseKanji,
+                katakana = fieldForIcr.Settings.UseKatakana,
+                lowerCaseLatin = fieldForIcr.Settings.UseLowerCaseLatin,
+                upperCaseLatin = fieldForIcr.Settings.UseUpperCaseLatin,
+                punctuation = fieldForIcr.Settings.UsePunctuation,
+            };
+            return new PostRequestMultiLine()
+            {
+                characterType = newCharacterType,
+                configuration = new PostRequestConfiguration() { languageModel = DoesLanguageModelExists(newCharacterType) },
+                imageData = fieldForIcr.ImageData
+            };
+        }
+        /// <summary>
+        ///  Creates boxed characters object for post request for constructed field
+        /// </summary>
+        /// <param name="fieldForIcr">Constructed field to create PostRequestBoxedCharacters with</param>
+        /// <returns>PostRequestBoxedCharacters instance</returns>
+        private PostRequestBoxedCharacters CreateBoxedCharacters(FieldForRecognition fieldForIcr)
+        {
+            return new PostRequestBoxedCharacters()
+            {
+                characterType = new PostRequestCharacterType()
+                {
+                    digits = fieldForIcr.Settings.UseDigits,
+                    hiragana = fieldForIcr.Settings.UseHiragana,
+                    kanji = fieldForIcr.Settings.UseKanji,
+                    katakana = fieldForIcr.Settings.UseKatakana,
+                    lowerCaseLatin = fieldForIcr.Settings.UseLowerCaseLatin,
+                    upperCaseLatin = fieldForIcr.Settings.UseUpperCaseLatin,
+                    punctuation = fieldForIcr.Settings.UsePunctuation,
+                },
+                marginBetweenBoxes = fieldForIcr.Settings.Margin,
+                numberOfBoxes = fieldForIcr.Settings.BoxesNumber,
+                imageData = fieldForIcr.ImageData
+            };
+        }
+        /// <summary>
+        /// According to Tegaki documentation the language model exists only for these options of character types
+        /// </summary>
+        /// <param name="characterType">Character type (see model)</param>
+        /// <returns>True if language model exists</returns>
+        private bool DoesLanguageModelExists(PostRequestCharacterType characterType)
+        {
+            return characterType.hiragana
+                   || characterType.kanji
+                   || characterType.lowerCaseLatin
+                   || characterType.upperCaseLatin;
+        }
+    }
+    /// <summary>
+    /// Tegaki connector itself (communication with Tegaki)
+    /// </summary>
+    public class TegakiConnector
+    {
+        /// <summary>
+        /// Recieved from Cogent Labs
+        /// </summary>
+        private string _apiKey;
+        /// <summary>
+        /// By default this is https://api.tegaki.ai/hwr/v2/
+        /// </summary>
+        private string _apiUri;
+        /// <summary>
+        /// Main constructor
+        /// </summary>
+        /// <param name="apiKey">Can be recieved from Cogent Labs, guid-like string</param>
+        /// <param name="apiUri">by default https://api.tegaki.ai/hwr/v2/ </param>
+        public TegakiConnector(string apiKey, string apiUri)
+        {
+            _apiKey = apiKey;
+            _apiUri = apiUri;
+        }
+        /// <summary>
+        /// Returns requestId that used for getting recognition results
+        /// </summary>       
+        /// <param name="content">Request content as string</param>
+        /// <returns>Response as string</returns>
+        public string SendPostRequest(string content)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(_apiUri + "field/");
+            #region Request settings
+            request.Method = "POST";
+            request.Headers["Authorization"] = "apikey " + _apiKey;
+            request.ContentType = "application/json";
+            var byteArray = Encoding.UTF8.GetBytes(content);
+            request.ContentLength = byteArray.Length;
+            var newStream = request.GetRequestStream();
+            newStream.Write(byteArray, 0, byteArray.Length);
+            newStream.Close();
+            #endregion Request settings
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                var encoding = Encoding.GetEncoding(response.CharacterSet);
+                using (var responseStream = response.GetResponseStream())
+                using (var reader = new StreamReader(responseStream, encoding))
+                    return JsonConvert.DeserializeObject<PostResponse>(reader.ReadToEnd()).requestId;
+            }
+        }
+        /// <summary>
+        /// Gets recognition results for specified requestId if completed
+        /// </summary>
+        /// <param name="requestId">requestId string returned by SendPostRequest</param>
+        /// <param name="responce">Result of the recognition</param>
+        /// <returns>True if recognition was successful</returns>
+        public bool GetRecognitionResult(string requestId, out GetResponse responce)
+        {
+            responce = null;
+            var request = (HttpWebRequest)WebRequest.Create(_apiUri + "request/" + requestId);
+            #region Request settings
+            request.Method = "GET";
+            request.Headers["Authorization"] = "apikey " + _apiKey;
+            #endregion Request settings
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                var encoding = Encoding.GetEncoding(response.CharacterSet);
+                using (var responseStream = response.GetResponseStream())
+                {
+                    using (var reader = new StreamReader(responseStream, encoding))
+                    {
+                        var getResponse = JsonConvert.DeserializeObject<GetResponse>(reader.ReadToEnd());
+                        if (getResponse.state != "COMPLETED")
+                            return false;
+                        responce = getResponse;
+                        return true;
+                    }
+                }
+            }
+        }
+        /// <summary>
+        /// Deletes recognition results from Tegaki server
+        /// </summary>
+        /// <param name="requestId">requestId string returned by SendPostRequest</param>
+        public void DeleteRecognitionResults(string requestId)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(_apiUri + "request/" + requestId);
+            #region Request settings
+            request.Method = "DELETE";
+            request.Headers["Authorization"] = "apikey " + _apiKey;
+            #endregion Request settings
+            using (var response = (HttpWebResponse)request.GetResponse())
+                ;
+        }
+    }
+
+    #region Serialization model
+    /// <summary>
+    /// Main model class to deserialize content of GET request response
+    /// </summary>
+    public class GetResponse
+    {
+        /// <summary>
+        /// Unique requestId generated by the API service
+        /// </summary>
+        public string requestId { get; set; }
+        /// <summary>
+        /// Unique identifier for a user
+        /// </summary>
+        public string userId { get; set; }
+        /// <summary>
+        /// API version
+        /// </summary>
+        public string version { get; set; }
+        /// <summary>
+        /// Enum: "RUNNING", "COMPLETED" or "FAILED" string indicating the current state of a accepted request
+        /// </summary>
+        public string state { get; set; }
+        /// <summary>
+        /// Timestamp the request was accepted and created
+        /// </summary>
+        public DateTime created { get; set; }
+        /// <summary>
+        /// Timestamp last time the request got updated
+        /// </summary>
+        public DateTime modified { get; set; }
+        /// <summary>
+        /// List of fields with results returned from Tegaki
+        /// </summary>
+        public List<GetResponseResult> results { get; set; }
+    }
+    /// <summary>
+    /// Returned field content is deserialized into this
+    /// </summary>
+    public class GetResponseResult
+    {
+        /// <summary>
+        /// Unique identifier for a single field generated by the API service
+        /// </summary>
+        public string fieldId { get; set; }
+        /// <summary>
+        /// Field name
+        /// </summary>
+        public string name { get; set; }
+        /// <summary>
+        /// If a field is of single line type a returned field is deserialized into this property
+        /// </summary>
+        public GetResponseSingleLine singleLine { get; set; }
+        /// <summary>
+        /// If a field is of multiline type a returned field is deserialized into this property
+        /// </summary>
+        public GetResponseMultiLine multiLine { get; set; }
+        /// <summary>
+        /// If a field is of boxed type a returned field is deserialized into this property
+        /// </summary>
+        public GetResponseBoxedCharacters boxedCharacters { get; set; }
+    }
+    /// <summary>
+    /// If a field is of single line type returned field content is deserialized into this 
+    /// </summary>
+    public class GetResponseSingleLine
+    {
+        /// <summary>
+        /// A number that represents a probability
+        /// </summary>
+        public double confidence { get; set; }
+        /// <summary>
+        /// Recognized characters
+        /// </summary>
+        public List<GetResponseCharacter> characters { get; set; }
+        /// <summary>
+        /// Interpreted result as a string
+        /// </summary>
+        public string text { get; set; }
+    }
+    /// <summary>
+    /// If a field is of multiline type returned field content is deserialized into this 
+    /// </summary>
+    public class GetResponseMultiLine
+    {
+        /// <summary>
+        /// A number that represents a probability
+        /// </summary>
+        public double confidence { get; set; }
+        /// <summary>
+        /// List of single line results
+        /// </summary>
+        public GetResponseSingleLine[] lines { get; set; }
+    }
+    /// <summary>
+    /// If a field is of boxed type returned field content is deserialized into this 
+    /// </summary>
+    public class GetResponseBoxedCharacters
+    {
+        /// <summary>
+        /// Interpreted result as a string
+        /// </summary>
+        public string text { get; set; }
+        /// <summary>
+        /// A number that represents a probability
+        /// </summary>
+        public double confidence { get; set; }
+        /// <summary>
+        /// Recognized characters
+        /// </summary>
+        public List<GetResponseCharacter> characters { get; set; }
+    }
+    /// <summary>
+    /// Single recognized character of a returned field
+    /// </summary>
+    public class GetResponseCharacter
+    {
+        /// <summary>
+        /// A single recognized character
+        /// </summary>
+        public string character { get; set; }
+        /// <summary>
+        /// A number that represents a probability
+        /// </summary>
+        public double confidence { get; set; }
+    }
+    /// <summary>
+    /// Main model class to serialize to request content to send to Tegaki
+    /// </summary>
+    public class PostRequest
+    {
+        /// <summary>
+        /// API version
+        /// </summary>
+        public string version { get; set; }
+        /// <summary>
+        /// List of constructed fields wrapped in PostRequestField instances
+        /// </summary>
+        public List<PostRequestField> fields { get; set; }
+        /// <summary>
+        /// Main constructor
+        /// </summary>
+        public PostRequest()
+        {
+            version = "2";
+            fields = new List<PostRequestField>();
+        }
+        /// <summary>
+        /// Overrided method that returns PostRequest content as string
+        /// </summary>
+        /// <returns>PostRequest as string</returns>
+        public override string ToString()
+        {
+            return JsonConvert.SerializeObject(this,
+                new JsonSerializerSettings() { NullValueHandling = NullValueHandling.Ignore });
+        }
+    }
+    /// <summary>
+    /// POST request field that constructed field is wrapped to before sending to Tegaki
+    /// </summary>
+    public class PostRequestField
+    {
+        /// <summary>
+        /// Field name to send to Tegaki
+        /// </summary>
+        public string name { get; set; }
+        /// <summary>
+        /// If a field is of single line type this propery is being filled with field content
+        /// </summary>
+        public PostRequestSingleLine singleLine { get; set; }
+        /// <summary>
+        /// If a field is of multiline type this propery is being filled with field content
+        /// </summary>
+        public PostRequestMultiLine multiLine { get; set; }
+        /// <summary>
+        /// If a field is of boxed type this propery is being filled with field content
+        /// </summary>
+        public PostRequestBoxedCharacters boxedCharacters { get; set; }
+    }
+    /// <summary>
+    /// If a field is of single line type object of this type is being created with field content that is to be filled in PostRequestField object
+    /// </summary>
+    public class PostRequestSingleLine
+    {
+        /// <summary>
+        /// Image in base64 format
+        /// </summary>
+        public string imageData { get; set; }
+        /// <summary>
+        /// Field symbols character type
+        /// </summary>
+        public PostRequestCharacterType characterType { get; set; }
+        /// <summary>
+        /// Field additional configuration
+        /// </summary>
+        public PostRequestConfiguration configuration { get; set; }
+    }
+    /// <summary>
+    /// If a field is of multiline type object of this type is being created with field content that is to be filled in PostRequestField object
+    /// </summary>
+    public class PostRequestMultiLine
+    {
+        /// <summary>
+        /// Image in base64 format
+        /// </summary>
+        public string imageData { get; set; }
+        /// <summary>
+        /// Field symbols character type
+        /// </summary>
+        public PostRequestCharacterType characterType { get; set; }
+        /// <summary>
+        /// Field additional configuration
+        /// </summary>
+        public PostRequestConfiguration configuration { get; set; }
+    }
+    /// <summary>
+    /// If a field is of boxed type object of this type is being created with field content that is to be filled in PostRequestField object
+    /// </summary>
+    public class PostRequestBoxedCharacters
+    {
+        /// <summary>
+        /// Image in base64 format
+        /// </summary>
+        public string imageData { get; set; }
+        /// <summary>
+        /// Field symbols character type
+        /// </summary>
+        public PostRequestCharacterType characterType { get; set; }
+        /// <summary>
+        /// Number of boxes
+        /// </summary>
+        public int numberOfBoxes { get; set; }
+        /// <summary>
+        /// Margin between boxes
+        /// </summary>
+        public int marginBetweenBoxes { get; set; }
+    }
+    /// <summary>
+    /// POST request field character type
+    /// </summary>
+    public class PostRequestCharacterType
+    {
+        /// <summary>
+        /// Hiragana character type
+        /// </summary>
+        public bool hiragana { get; set; }
+        /// <summary>
+        /// Katakana character type
+        /// </summary>
+        public bool katakana { get; set; }
+        /// <summary>
+        /// Kanji character type
+        /// </summary>
+        public bool kanji { get; set; }
+        /// <summary>
+        /// Digits character type
+        /// </summary>
+        public bool digits { get; set; }
+        /// <summary>
+        /// Upper case latin character type
+        /// </summary>
+        public bool upperCaseLatin { get; set; }
+        /// <summary>
+        /// Lower case latin character type
+        /// </summary>
+        public bool lowerCaseLatin { get; set; }
+        /// <summary>
+        /// Punctuation character type
+        /// </summary>
+        public bool punctuation { get; set; }
+    }
+    /// <summary>
+    /// POST request field additional configuration
+    /// </summary>
+    public class PostRequestConfiguration
+    {
+        /// <summary>
+        /// Indicates whether language model exists
+        /// </summary>
+        public bool languageModel { get; set; }
+    }
+    /// <summary>
+    /// Main model class to deserialize content of POST request response
+    /// </summary>
+    public class PostResponse
+    {
+        /// <summary>
+        /// Unique requestId generated by the API service
+        /// </summary>
+        public string requestId { get; set; }
+        /// <summary>
+        /// List of fields returned from Tegaki after POST request performed
+        /// </summary>
+        public List<PostResponseField> fields { get; set; }
+    }
+    /// <summary>
+    /// Tegaki response field type model after POST request performed
+    /// </summary>
+    public class PostResponseField
+    {
+        /// <summary>
+        /// Field Id for a returned field
+        /// </summary>
+        public string fieldId { get; set; }
+        /// <summary>
+        /// Field name
+        /// </summary>
+        public string name { get; set; }
+        /// <summary>
+        /// Path to the field
+        /// </summary>
+        public string fieldPath { get; set; }
+    }
+    #endregion
+}

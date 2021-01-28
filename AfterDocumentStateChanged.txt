@@ -1,0 +1,111 @@
+using System.Collections.Generic;
+using GlobalWorkflow;
+
+if (!ChangedStates.Has(2) 
+    || !Document.IsRecognized
+    || string.IsNullOrEmpty(Document.DefinitionName))
+    return;
+
+const double defaultConfidence = 0.95d;
+
+//    Optional parameters for creating Recognition settings object: 
+//    Katakana, 
+//    Hiragana, 
+//    Kanji, 
+//    Digits, 
+//    LowerCaseLatin, 
+//    UpperCaseLatin, 
+//    Punctuation
+
+//    Also can be used some presets: 
+//    CharacterType.Digits, 
+//    CharacterType.Latin, 
+//    CharacterType.Japan, 
+//    CharacterType.DigitsAndJapan, 
+//    CharacterType.DigitsAndLatin, 
+//    CharacterType.All
+
+//    For the boxed field type can be specified BoxedNumber and Margin parameters
+
+//    Settings presets:
+var allSymbols = new RecognitionSettings(CharacterType.All);
+var japaneseSymbols = new RecognitionSettings(Hiragana: true, Katakana: true, Kanji: true);
+var digitsSymbols = new RecognitionSettings(CharacterType.Digits);
+
+//List of fields for recognition. 
+var fields = new List<FieldForRecognition>();
+
+//Creation of Filed for recognition object
+//Parameter 1: field from FlexiCapture
+//Parameter 2: recognition settings 
+//    For the boxed field type can be specified BoxedNumber and Margin parameters
+//Parameter 3: confidence level
+switch(Document.DefinitionName)
+{
+    case "SampleDocDef":
+        for (int n = 0; n < Document.Sections.Count; n++)
+        {
+            switch (Document.Sections[n].Name)
+            {
+                case "Document Section 1":
+                    fields.Add(new TextField(Document.Sections[0].Field(@"Name"), 
+                        japaneseSymbols, defaultConfidence));
+                    fields.Add(new BoxedField(Document.Sections[0].Field(@"Number"), 
+                        new RecognitionSettings(Digits: true, Hiragana: true, Katakana: true, Kanji: true, BoxesNumber: 7, Margin: 0), defaultConfidence));
+                    fields.Add(new MultiLineField(Document.Sections[0].Field(@"TextRegion"),
+                        allSymbols, defaultConfidence));
+                    break;
+                
+                default:
+                    FCTools.ShowMessage("There is no document section with name \"" + Document.Sections[n].Name + "\" described for Tegaki recognition for \"" + Document.DefinitionName + "\" document definition.");
+                    break;
+            }
+        }
+        break;
+
+    /*
+    case "SampleNonExistingDocDef":
+        //just sample to show the capabilities and examples of usage
+        fields.Add(new BoxedField(Document.Sections[0].Field(@"Section\Numbers1"), 
+            new RecognitionSettings(Digits: true, BoxesNumber: 22, Margin: 0), defaultConfidence));
+        
+        fields.Add(new BoxedField(Document.Sections[0].Field(@"Section\Numbers2"), 
+            new RecognitionSettings(Digits: true, Hiragana: true, Katakana: true, Kanji: true, BoxesNumber: 22, Margin: 0), defaultConfidence));
+        
+        
+        fields.Add(new TextField(Document.Sections[0].Field(@"Section\Text1"), japaneseSymbols, defaultConfidence));
+        
+        fields.Add(new TextField(Document.Sections[0].Field(@"Section\Text2"), new RecognitionSettings(CharacterType.Latin), defaultConfidence));
+        
+        fields.Add(new TextField(Document.Sections[0].Field(@"Section\Text3"), allSymbols, defaultConfidence));
+        
+        
+        fields.Add(new MultiLineField(Document.Sections[0].Field(@"Section\Text2Lines1"), 
+            new RecognitionSettings(Hiragana: true, Katakana: true, Kanji: true), defaultConfidence));
+        fields.Add(new MultiLineField(Document.Sections[0].Field(@"Section\Text2Lines2"), 
+            new RecognitionSettings(LowerCaseLatin: true, UpperCaseLatin: true, Digits: true), defaultConfidence));
+        fields.Add(new MultiLineField(Document.Sections[0].Field(@"Section\Text2Lines3"), 
+            new RecognitionSettings(Hiragana: true, Katakana: true, Kanji: true, LowerCaseLatin: true, UpperCaseLatin: true, Digits: true, Punctuation: true),
+                 defaultConfidence));
+        
+        
+        fields.Add(new MultiLineField(Document.Sections[0].Field(@"Section\Text3Lines1"), 
+            new RecognitionSettings(Hiragana: true, Katakana: true, Kanji: true), defaultConfidence));
+        fields.Add(new MultiLineField(Document.Sections[0].Field(@"Section\Text3Lines2"), 
+            new RecognitionSettings(LowerCaseLatin: true, UpperCaseLatin: true, Digits: true), defaultConfidence));
+        
+        break;
+    */
+    
+    default:
+        FCTools.ShowMessage("There are no fields specified for Tegaki recognition for '" + Document.DefinitionName + "' document definition" );
+        return;
+}
+
+ 
+//Execute recognition
+if(fields.Count == 0)
+    return;
+    
+var stage = new Stage(Document, fields);
+stage.Execute();
